@@ -1,0 +1,356 @@
+// VariableRateShading_SM64.hlsl - Variable Rate Shading Example (Shader Model 6.4)
+// Demonstrates advanced VRS techniques with motion-adaptive shading rates
+
+#if __SHADER_TARGET_MAJOR < 6 || (__SHADER_TARGET_MAJOR == 6 && __SHADER_TARGET_MINOR < 4)
+#error "This shader requires Shader Model 6.4 or higher for Variable Rate Shading"
+#endif
+
+// VRS Constants
+cbuffer VRSParams : register(b0)
+{
+    float4x4 g_worldViewProj;
+    float4 g_screenSize;             // xy: screen dimensions, zw: inverse
+    float4 g_vrsParams;              // x: base rate, y: motion threshold, z: depth threshold, w: foveation strength
+    float4 g_foveationCenter;        // xy: center point (0-1), zw: inner/outer radius
+    float4 g_motionParams;           // x: motion scale, y: velocity threshold, z: acceleration factor, w: padding
+    uint4 g_vrsFlags;                // x: enable foveation, y: enable motion, z: enable depth, w: debug mode
+};
+
+// Input textures for VRS decision making
+Texture2D<float2> g_motionTexture : register(t0);
+Texture2D<float> g_depthTexture : register(t1);
+Texture2D<float4> g_colorTexture : register(t2);
+Texture2D<float> g_luminanceTexture : register(t3);
+
+// VRS rate image output (2x2 pixel blocks)
+RWTexture2D<uint> g_vrsRateImage : register(u0);
+
+SamplerState g_linearSampler : register(s0);
+SamplerState g_pointSampler : register(s1);
+
+// VRS rate definitions (D3D12_SHADING_RATE values)
+static const uint VRS_1X1 = 0x0;  // 1x1 shading rate (full resolution)
+static const uint VRS_1X2 = 0x1;  // 1x2 shading rate
+static const uint VRS_2X1 = 0x4;  // 2x1 shading rate
+static const uint VRS_2X2 = 0x5;  // 2x2 shading rate (quarter resolution)
+static const uint VRS_2X4 = 0x6;  // 2x4 shading rate
+static const uint VRS_4X2 = 0x9;  // 4x2 shading rate
+static const uint VRS_4X4 = 0xa;  // 4x4 shading rate (1/16 resolution)
+
+// SM 6.4: Advanced wave intrinsics for VRS analysis
+groupshared float g_sharedMotion[8][8];
+groupshared float g_sharedDepth[8][8];
+groupshared float g_sharedLuminance[8][8];
+
+// Calculate foveated shading rate based on distance from center
+uint CalculateFoveatedRate(float2 uv)
+{
+    if (g_vrsFlags.x == 0)
+        return VRS_1X1;
+
+    float2 center = g_foveationCenter.xy;
+    float distFromCenter = length(uv - center);
+
+    float innerRadius = g_foveationCenter.z;
+    float outerRadius = g_foveationCenter.w;
+
+    // Progressive degradation from center
+    if (distFromCenter < innerRadius)
+    {
+        return VRS_1X1; // Full resolution in fovea
+    }
+    else if (distFromCenter < innerRadius + (outerRadius - innerRadius) * 0.3)
+    {
+        return VRS_1X2; // Slight reduction in near periphery
+    }
+    else if (distFromCenter < innerRadius + (outerRadius - innerRadius) * 0.6)
+    {
+        return VRS_2X1; // Medium reduction
+    }
+    else if (distFromCenter < outerRadius)
+    {
+        return VRS_2X2; // Significant reduction in periphery
+    }
+    else
+    {
+        return VRS_4X4; // Maximum reduction in far periphery
+    }
+}
+
+// Calculate motion-based shading rate
+uint CalculateMotionBasedRate(float2 uv, uint2 groupThreadID)
+{
+    if (g_vrsFlags.y == 0)
+        return VRS_1X1;
+
+    // Load motion into shared memory for neighborhood analysis
+    uint2 sharedCoord = groupThreadID;
+    float2 motion = g_motionTexture.SampleLevel(g_pointSampler, uv, 0).xy;
+    float motionMagnitude = length(motion) * g_motionParams.x;
+
+    g_sharedMotion[sharedCoord.x][sharedCoord.y] = motionMagnitude;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Use wave intrinsics for motion analysis
+    float avgMotion = WaveActiveSum(motionMagnitude) / float(WaveGetLaneCount());
+    float maxMotion = WaveActiveMax(motionMagnitude);
+
+    // Analyze motion coherency in neighborhood
+    float motionCoherency = 1.0;
+    if (all(sharedCoord < 7)) // Check bounds for 3x3 sampling
+    {
+        float centerMotion = g_sharedMotion[sharedCoord.x][sharedCoord.y];
+        float variance = 0.0;
+
+        [unroll]
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            [unroll]
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                if (dx == 0 && dy == 0) continue;
+
+                float neighborMotion = g_sharedMotion[sharedCoord.x + dx][sharedCoord.y + dy];
+                float diff = abs(centerMotion - neighborMotion);
+                variance += diff * diff;
+            }
+        }
+        variance /= 8.0;
+        motionCoherency = saturate(1.0 - variance * 4.0);
+    }
+
+    // Determine shading rate based on motion characteristics
+    float motionThreshold = g_vrsParams.y;
+
+    if (motionMagnitude < motionThreshold * 0.5)
+    {
+        return VRS_1X1; // Static or slow-moving areas get full resolution
+    }
+    else if (motionMagnitude < motionThreshold && motionCoherency > 0.7)
+    {
+        return VRS_1X2; // Coherent medium motion
+    }
+    else if (motionMagnitude < motionThreshold * 2.0)
+    {
+        return motionCoherency > 0.5 ? VRS_2X1 : VRS_2X2; // Fast motion, check coherency
+    }
+    else
+    {
+        return VRS_2X2; // Very fast or incoherent motion
+    }
+}
+
+// Calculate depth-based shading rate for focus effects
+uint CalculateDepthBasedRate(float2 uv, uint2 groupThreadID)
+{
+    if (g_vrsFlags.z == 0)
+        return VRS_1X1;
+
+    // Load depth into shared memory
+    uint2 sharedCoord = groupThreadID;
+    float depth = g_depthTexture.SampleLevel(g_pointSampler, uv, 0);
+    g_sharedDepth[sharedCoord.x][sharedCoord.y] = depth;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Use wave intrinsics for depth analysis
+    float avgDepth = WaveActiveSum(depth) / float(WaveGetLaneCount());
+    float depthVariance = WaveActiveSum(abs(depth - avgDepth)) / float(WaveGetLaneCount());
+
+    // Calculate depth-of-field effect
+    float focusDepth = 0.5; // Could be a parameter
+    float focusRange = 0.1;
+    float depthDiff = abs(depth - focusDepth);
+
+    // Areas outside focus range get reduced shading
+    if (depthDiff > focusRange * 2.0)
+    {
+        return VRS_2X2; // Far out of focus
+    }
+    else if (depthDiff > focusRange)
+    {
+        return VRS_2X1; // Moderately out of focus
+    }
+    else if (depthVariance > g_vrsParams.z)
+    {
+        return VRS_1X2; // High depth variance (edges)
+    }
+
+    return VRS_1X1; // In focus areas get full resolution
+}
+
+// Calculate luminance-based shading rate
+uint CalculateLuminanceBasedRate(float2 uv, uint2 groupThreadID)
+{
+    // Load luminance into shared memory
+    uint2 sharedCoord = groupThreadID;
+    float luminance = g_luminanceTexture.SampleLevel(g_pointSampler, uv, 0);
+    g_sharedLuminance[sharedCoord.x][sharedCoord.y] = luminance;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Use wave intrinsics for luminance analysis
+    float avgLuminance = WaveActiveSum(luminance) / float(WaveGetLaneCount());
+    float luminanceVariance = WaveActiveSum(abs(luminance - avgLuminance)) / float(WaveGetLaneCount());
+
+    // High contrast areas need full resolution
+    if (luminanceVariance > 0.1)
+    {
+        return VRS_1X1; // High contrast/detail areas
+    }
+    else if (luminance < 0.1)
+    {
+        return VRS_2X2; // Dark areas can use lower resolution
+    }
+    else if (luminance > 0.9)
+    {
+        return VRS_2X1; // Bright areas with less detail
+    }
+
+    return VRS_1X1; // Default to full resolution
+}
+
+// Combine multiple VRS factors intelligently
+uint CombineVRSRates(uint foveatedRate, uint motionRate, uint depthRate, uint luminanceRate)
+{
+    // Priority system: take the highest quality requirement
+    uint rates[4] = { foveatedRate, motionRate, depthRate, luminanceRate };
+
+    // Sort rates by quality (lower values = higher quality)
+    uint finalRate = VRS_4X4; // Start with lowest quality
+
+    [unroll]
+    for (int i = 0; i < 4; i++)
+    {
+        if (rates[i] < finalRate)
+        {
+            finalRate = rates[i];
+        }
+    }
+
+    // Special case: if motion is high but other factors want high quality,
+    // compromise with an asymmetric rate
+    if (motionRate >= VRS_2X2 && (depthRate <= VRS_1X2 || luminanceRate <= VRS_1X2))
+    {
+        return VRS_2X1; // Reduce in motion direction only
+    }
+
+    return finalRate;
+}
+
+// Debug visualization of VRS rates
+float4 VisualizeVRSRate(uint rate, float2 uv)
+{
+    switch (rate)
+    {
+        case VRS_1X1: return float4(0, 1, 0, 1);    // Green - full resolution
+        case VRS_1X2: return float4(0, 1, 1, 1);    // Cyan - 1x2
+        case VRS_2X1: return float4(1, 1, 0, 1);    // Yellow - 2x1
+        case VRS_2X2: return float4(1, 0.5, 0, 1);  // Orange - 2x2
+        case VRS_2X4: return float4(1, 0, 0, 1);    // Red - 2x4
+        case VRS_4X2: return float4(1, 0, 1, 1);    // Magenta - 4x2
+        case VRS_4X4: return float4(0.5, 0, 0, 1);  // Dark red - 4x4
+        default: return float4(1, 1, 1, 1);         // White - unknown
+    }
+}
+
+// Main compute shader for VRS rate generation
+[numthreads(8, 8, 1)]
+void CSGenerateVRSRates(uint3 dispatchThreadID : SV_DispatchThreadID,
+                       uint3 groupID : SV_GroupID,
+                       uint3 groupThreadID : SV_GroupThreadID)
+{
+    uint2 coord = dispatchThreadID.xy;
+
+    // VRS rate image is typically 1/16th the screen resolution (each texel covers 2x2 pixels)
+    uint2 vrsImageSize = uint2(g_screenSize.xy) / 16;
+    if (any(coord >= vrsImageSize))
+        return;
+
+    // Calculate UV coordinates for the center of the 2x2 block this VRS texel represents
+    float2 uv = (float2(coord) * 16.0 + 8.0) / g_screenSize.xy;
+
+    // Calculate individual VRS factors
+    uint foveatedRate = CalculateFoveatedRate(uv);
+    uint motionRate = CalculateMotionBasedRate(uv, groupThreadID.xy);
+    uint depthRate = CalculateDepthBasedRate(uv, groupThreadID.xy);
+    uint luminanceRate = CalculateLuminanceBasedRate(uv, groupThreadID.xy);
+
+    // Combine all factors
+    uint finalRate = CombineVRSRates(foveatedRate, motionRate, depthRate, luminanceRate);
+
+    // Apply base rate override if specified
+    if (g_vrsParams.x > 0.0)
+    {
+        uint baseRate = (uint)g_vrsParams.x;
+        finalRate = max(finalRate, baseRate); // Don't go below base rate
+    }
+
+    // Write final rate to VRS image
+    g_vrsRateImage[coord] = finalRate;
+}
+
+// Debug visualization compute shader
+RWTexture2D<float4> g_debugOutput : register(u1);
+
+[numthreads(16, 16, 1)]
+void CSDebugVRS(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint2 coord = dispatchThreadID.xy;
+    if (any(coord >= uint2(g_screenSize.xy)))
+        return;
+
+    float2 uv = (float2(coord) + 0.5) / g_screenSize.xy;
+
+    // Calculate which VRS rate would be applied to this pixel
+    uint2 vrsCoord = coord / 16; // VRS image coordinates
+    uint rate = g_vrsRateImage.Load(uint3(vrsCoord, 0));
+
+    float4 debugColor = VisualizeVRSRate(rate, uv);
+
+    // Overlay original image with transparency
+    float4 originalColor = g_colorTexture.SampleLevel(g_linearSampler, uv, 0);
+    debugColor = lerp(originalColor, debugColor, 0.6);
+
+    // Add grid lines to show VRS block boundaries
+    uint2 blockPos = coord % 16;
+    if (blockPos.x == 0 || blockPos.y == 0)
+    {
+        debugColor = lerp(debugColor, float4(1, 1, 1, 1), 0.3);
+    }
+
+    g_debugOutput[coord] = debugColor;
+}
+
+// Example pixel shader that benefits from VRS
+struct VSOutput
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+    float3 worldPos : TEXCOORD1;
+    float3 normal : TEXCOORD2;
+};
+
+float4 PSComplexShading(VSOutput input) : SV_Target
+{
+    float2 uv = input.uv;
+    float3 worldPos = input.worldPos;
+    float3 normal = normalize(input.normal);
+
+    // This would be a complex shading operation that benefits from VRS
+    // when visual quality loss is acceptable (fast motion, out of focus, etc.)
+
+    float4 baseColor = g_colorTexture.SampleLevel(g_linearSampler, uv, 0);
+
+    // Complex lighting calculations that are expensive
+    float3 lightDir = normalize(float3(1, 1, 1));
+    float ndotl = saturate(dot(normal, lightDir));
+
+    // Multiple light bounces, complex materials, etc.
+    float3 lighting = ndotl * float3(1, 1, 1);
+
+    // The VRS system will automatically reduce the resolution of this
+    // expensive shading in areas where it won't be noticeable
+
+    return float4(baseColor.rgb * lighting, baseColor.a);
+}

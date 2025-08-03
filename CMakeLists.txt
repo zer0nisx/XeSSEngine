@@ -16,8 +16,9 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/Core
     ${CMAKE_CURRENT_SOURCE_DIR}/Graphics
     ${CMAKE_CURRENT_SOURCE_DIR}/XeSS
-    ${CMAKE_CURRENT_SOURCE_DIR}/Rendering
+    # ${CMAKE_CURRENT_SOURCE_DIR}/Rendering
     ${CMAKE_CURRENT_SOURCE_DIR}/Application
+    ${CMAKE_CURRENT_SOURCE_DIR}/SDK/XeSS_SDK_2.1.0/inc
 )
 
 # Core module
@@ -26,11 +27,14 @@ add_subdirectory(Core)
 # Graphics module
 add_subdirectory(Graphics)
 
+# ShaderCompiler module
+add_subdirectory(Graphics/ShaderCompiler)
+
 # XeSS module
 add_subdirectory(XeSS)
 
-# Rendering module
-add_subdirectory(Rendering)
+# Rendering module (commented out until implemented)
+# add_subdirectory(Rendering)
 
 # Application module
 add_subdirectory(Application)
@@ -53,16 +57,8 @@ if(MSVC)
     endif()
 endif()
 
-# Copy XeSS DLLs and shaders
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../uploads/XeSS_SDK_2.1.0/bin/")
-    set(XESS_BIN_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../uploads/XeSS_SDK_2.1.0/bin/")
-    add_custom_target(CopyXeSSFiles ALL
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${XESS_BIN_PATH}/libxess_dx11.dll"
-            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/libxess_dx11.dll"
-        COMMENT "Copying XeSS DLLs"
-    )
-endif()
+# Link XeSS libraries
+link_directories(${CMAKE_CURRENT_SOURCE_DIR}/SDK/XeSS_SDK_2.1.0/lib)
 
 # Copy shaders
 add_custom_target(CopyShaders ALL

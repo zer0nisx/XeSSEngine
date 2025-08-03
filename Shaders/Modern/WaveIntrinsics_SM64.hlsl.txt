@@ -1,0 +1,431 @@
+// WaveIntrinsics_SM64.hlsl - Wave Intrinsics Showcase (Shader Model 6.4)
+// Demonstrates advanced wave operations for parallel processing
+
+#if __SHADER_TARGET_MAJOR < 6
+#error "This shader requires Shader Model 6.0 or higher for Wave Intrinsics"
+#endif
+
+// Wave intrinsics constants
+cbuffer WaveParams : register(b0)
+{
+    float4 g_screenSize;           // xy: dimensions, zw: inverse
+    float4 g_filterParams;         // x: kernel size, y: sigma, z: threshold, w: mode
+    uint4 g_waveParams;           // x: operation type, y: reduction type, z: scan type, w: debug
+    float4 g_debugColor;          // Debug visualization color
+};
+
+// Input/Output textures
+Texture2D<float4> g_inputTexture : register(t0);
+Texture2D<float> g_depthTexture : register(t1);
+RWTexture2D<float4> g_outputTexture : register(u0);
+RWTexture2D<float4> g_debugTexture : register(u1);
+
+SamplerState g_linearSampler : register(s0);
+
+// Wave intrinsics demo: Parallel reduction operations
+groupshared float4 g_sharedData[64]; // 8x8 thread group
+groupshared float g_sharedDepth[64];
+
+// Wave operation types
+static const uint WAVE_OP_SUM = 0;
+static const uint WAVE_OP_PRODUCT = 1;
+static const uint WAVE_OP_MIN = 2;
+static const uint WAVE_OP_MAX = 3;
+static const uint WAVE_OP_AND = 4;
+static const uint WAVE_OP_OR = 5;
+static const uint WAVE_OP_XOR = 6;
+
+// Reduction types
+static const uint REDUCTION_ALL = 0;
+static const uint REDUCTION_ANY = 1;
+static const uint REDUCTION_BALLOT = 2;
+
+// Scan types
+static const uint SCAN_INCLUSIVE = 0;
+static const uint SCAN_EXCLUSIVE = 1;
+
+// Wave intrinsics: Basic operations showcase
+float4 DemoBasicWaveOps(float4 inputValue, uint operation)
+{
+    switch (operation)
+    {
+        case WAVE_OP_SUM:
+            return WaveActiveSum(inputValue);
+
+        case WAVE_OP_PRODUCT:
+            return WaveActiveProduct(inputValue);
+
+        case WAVE_OP_MIN:
+            return WaveActiveMin(inputValue);
+
+        case WAVE_OP_MAX:
+            return WaveActiveMax(inputValue);
+
+        case WAVE_OP_AND:
+            return WaveActiveBitAnd(asuint(inputValue));
+
+        case WAVE_OP_OR:
+            return WaveActiveBitOr(asuint(inputValue));
+
+        case WAVE_OP_XOR:
+            return WaveActiveBitXor(asuint(inputValue));
+
+        default:
+            return inputValue;
+    }
+}
+
+// Wave intrinsics: Advanced filtering using wave operations
+float4 WaveBasedBilateralFilter(float2 uv, float centerDepth, uint2 coord)
+{
+    const uint kernelSize = (uint)g_filterParams.x;
+    const float sigma = g_filterParams.y;
+    const float depthThreshold = g_filterParams.z;
+
+    float4 totalColor = float4(0, 0, 0, 0);
+    float totalWeight = 0.0;
+
+    // Get wave information
+    uint laneIndex = WaveGetLaneIndex();
+    uint laneCount = WaveGetLaneCount();
+
+    // Distribute sampling across wave lanes
+    uint samplesPerLane = (kernelSize * kernelSize + laneCount - 1) / laneCount;
+
+    [loop]
+    for (uint sampleIdx = 0; sampleIdx < samplesPerLane; sampleIdx++)
+    {
+        uint globalSampleIdx = laneIndex * samplesPerLane + sampleIdx;
+        if (globalSampleIdx >= kernelSize * kernelSize)
+            break;
+
+        // Convert linear index to 2D offset
+        int2 offset = int2(globalSampleIdx % kernelSize, globalSampleIdx / kernelSize);
+        offset -= int2(kernelSize / 2, kernelSize / 2);
+
+        float2 sampleUV = uv + float2(offset) * g_screenSize.zw;
+
+        // Sample color and depth
+        float4 sampleColor = g_inputTexture.SampleLevel(g_linearSampler, sampleUV, 0);
+        float sampleDepth = g_depthTexture.SampleLevel(g_linearSampler, sampleUV, 0);
+
+        // Calculate spatial weight (Gaussian)
+        float spatialDist = length(float2(offset));
+        float spatialWeight = exp(-(spatialDist * spatialDist) / (2.0 * sigma * sigma));
+
+        // Calculate depth weight (bilateral)
+        float depthDiff = abs(sampleDepth - centerDepth);
+        float depthWeight = exp(-(depthDiff * depthDiff) / (2.0 * depthThreshold * depthThreshold));
+
+        float weight = spatialWeight * depthWeight;
+
+        totalColor += sampleColor * weight;
+        totalWeight += weight;
+    }
+
+    // Use wave intrinsics to sum results across all lanes
+    float4 waveColor = WaveActiveSum(totalColor);
+    float waveWeight = WaveActiveSum(totalWeight);
+
+    // Only the first lane needs to do the division
+    if (WaveIsFirstLane())
+    {
+        return waveWeight > 0.0 ? waveColor / waveWeight : float4(0, 0, 0, 1);
+    }
+
+    // Broadcast result to all lanes in the wave
+    return WaveReadLaneFirst(waveColor / waveWeight);
+}
+
+// Wave intrinsics: Parallel prefix sum (scan) operations
+float4 WavePrefixSum(float4 value, bool inclusive)
+{
+    if (inclusive)
+        return WavePrefixSum(value);
+    else
+        return WavePrefixSum(value) - value; // Exclusive scan
+}
+
+// Wave intrinsics: Motion coherency analysis
+float AnalyzeMotionCoherency(float2 uv, uint2 groupThreadID)
+{
+    // Sample motion vector
+    float2 motion = g_inputTexture.SampleLevel(g_linearSampler, uv, 0).xy;
+    float motionMagnitude = length(motion);
+
+    // Use wave intrinsics to analyze motion across the wave
+    float avgMotion = WaveActiveSum(motionMagnitude) / float(WaveGetLaneCount());
+    float minMotion = WaveActiveMin(motionMagnitude);
+    float maxMotion = WaveActiveMax(motionMagnitude);
+
+    // Calculate motion variance using wave operations
+    float variance = WaveActiveSum((motionMagnitude - avgMotion) * (motionMagnitude - avgMotion)) / float(WaveGetLaneCount());
+
+    // Motion coherency: low variance = high coherency
+    float coherency = 1.0 / (1.0 + variance * 10.0);
+
+    // Use wave ballot to count how many lanes have similar motion
+    float motionTolerance = 0.1;
+    bool similarMotion = abs(motionMagnitude - avgMotion) < motionTolerance;
+    uint4 ballot = WaveActiveBallot(similarMotion);
+    uint coherentLanes = countbits(ballot.x) + countbits(ballot.y) + countbits(ballot.z) + countbits(ballot.w);
+
+    float ballotCoherency = float(coherentLanes) / float(WaveGetLaneCount());
+
+    return (coherency + ballotCoherency) * 0.5;
+}
+
+// Wave intrinsics: Adaptive sampling pattern
+float4 WaveAdaptiveSample(float2 uv, float quality)
+{
+    uint laneIndex = WaveGetLaneIndex();
+    uint laneCount = WaveGetLaneCount();
+
+    // Adaptive sample count based on quality
+    uint baseSamples = 4;
+    uint maxSamples = 16;
+    uint sampleCount = lerp(baseSamples, maxSamples, quality);
+
+    // Distribute samples across wave lanes
+    float4 result = float4(0, 0, 0, 0);
+
+    [loop]
+    for (uint i = laneIndex; i < sampleCount; i += laneCount)
+    {
+        // Generate sampling pattern (Halton sequence)
+        float x = frac(float(i) * 0.5);
+        float y = frac(float(i) * 0.333333);
+
+        float2 offset = (float2(x, y) - 0.5) * 0.01; // Small offset
+        float2 sampleUV = uv + offset;
+
+        float4 sample = g_inputTexture.SampleLevel(g_linearSampler, sampleUV, 0);
+        result += sample;
+    }
+
+    // Sum all samples across the wave
+    float4 waveSum = WaveActiveSum(result);
+    uint totalSamples = WaveActiveSum(min(sampleCount - laneIndex, laneCount));
+
+    return waveSum / float(totalSamples);
+}
+
+// Wave intrinsics: Edge detection using wave operations
+float WaveEdgeDetection(float2 uv)
+{
+    float centerValue = g_inputTexture.SampleLevel(g_linearSampler, uv, 0).r;
+
+    // Sample neighbors using wave lanes
+    uint laneIndex = WaveGetLaneIndex();
+    float neighborValues[8];
+
+    const float2 offsets[8] = {
+        float2(-1, -1), float2(0, -1), float2(1, -1),
+        float2(-1,  0),                float2(1,  0),
+        float2(-1,  1), float2(0,  1), float2(1,  1)
+    };
+
+    // Each lane samples a different neighbor
+    if (laneIndex < 8)
+    {
+        float2 sampleUV = uv + offsets[laneIndex] * g_screenSize.zw;
+        neighborValues[laneIndex] = g_inputTexture.SampleLevel(g_linearSampler, sampleUV, 0).r;
+    }
+    else
+    {
+        neighborValues[laneIndex % 8] = centerValue;
+    }
+
+    // Use wave operations to find min/max among neighbors
+    float minNeighbor = WaveActiveMin(neighborValues[laneIndex % 8]);
+    float maxNeighbor = WaveActiveMax(neighborValues[laneIndex % 8]);
+
+    // Edge strength is the range of values
+    float edgeStrength = maxNeighbor - minNeighbor;
+
+    return edgeStrength;
+}
+
+// Wave intrinsics: Hierarchical reduction
+float4 HierarchicalReduction(uint2 coord, uint2 groupID)
+{
+    float4 pixelValue = g_inputTexture.Load(uint3(coord, 0));
+
+    // First level: wave reduction
+    float4 waveSum = WaveActiveSum(pixelValue);
+    float4 waveMin = WaveActiveMin(pixelValue);
+    float4 waveMax = WaveActiveMax(pixelValue);
+
+    // Store wave results in shared memory (first lane of each wave)
+    uint waveIndex = WaveGetLaneIndex() / WaveGetLaneCount();
+    if (WaveIsFirstLane())
+    {
+        g_sharedData[waveIndex * 4 + 0] = waveSum;
+        g_sharedData[waveIndex * 4 + 1] = waveMin;
+        g_sharedData[waveIndex * 4 + 2] = waveMax;
+        g_sharedData[waveIndex * 4 + 3] = pixelValue; // Original for comparison
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Second level: group reduction
+    if (WaveIsFirstLane())
+    {
+        float4 groupSum = float4(0, 0, 0, 0);
+        float4 groupMin = float4(1e10, 1e10, 1e10, 1e10);
+        float4 groupMax = float4(-1e10, -1e10, -1e10, -1e10);
+
+        [unroll]
+        for (uint i = 0; i < 16; i += 4) // Assuming max 4 waves per group
+        {
+            if (i < 64) // Check bounds
+            {
+                groupSum += g_sharedData[i];
+                groupMin = min(groupMin, g_sharedData[i + 1]);
+                groupMax = max(groupMax, g_sharedData[i + 2]);
+            }
+        }
+
+        g_sharedData[0] = groupSum;
+        g_sharedData[1] = groupMin;
+        g_sharedData[2] = groupMax;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Return combined result
+    return float4(g_sharedData[0].x, g_sharedData[1].y, g_sharedData[2].z, 1.0);
+}
+
+// Debug visualization for wave operations
+float4 VisualizeWaveOperations(float2 uv, uint2 coord)
+{
+    uint debugMode = g_waveParams.w;
+
+    switch (debugMode)
+    {
+        case 0: // Show wave lane index
+        {
+            uint laneIndex = WaveGetLaneIndex();
+            uint laneCount = WaveGetLaneCount();
+            float intensity = float(laneIndex) / float(laneCount);
+            return float4(intensity, intensity, intensity, 1);
+        }
+
+        case 1: // Show wave boundaries
+        {
+            bool isFirstLane = WaveIsFirstLane();
+            return isFirstLane ? float4(1, 0, 0, 1) : float4(0, 0, 0, 1);
+        }
+
+        case 2: // Show motion coherency
+        {
+            float coherency = AnalyzeMotionCoherency(uv, coord);
+            return float4(coherency, 1.0 - coherency, 0, 1);
+        }
+
+        case 3: // Show edge detection
+        {
+            float edge = WaveEdgeDetection(uv);
+            return float4(edge, edge, edge, 1);
+        }
+
+        default:
+            return g_inputTexture.SampleLevel(g_linearSampler, uv, 0);
+    }
+}
+
+// Main compute shader demonstrating wave intrinsics
+[numthreads(8, 8, 1)]
+void CSWaveIntrinsicsDemo(uint3 dispatchThreadID : SV_DispatchThreadID,
+                         uint3 groupID : SV_GroupID,
+                         uint3 groupThreadID : SV_GroupThreadID,
+                         uint groupIndex : SV_GroupIndex)
+{
+    uint2 coord = dispatchThreadID.xy;
+    if (any(coord >= uint2(g_screenSize.xy)))
+        return;
+
+    float2 uv = (float2(coord) + 0.5) / g_screenSize.xy;
+
+    // Load input data
+    float4 inputColor = g_inputTexture.Load(uint3(coord, 0));
+    float depth = g_depthTexture.Load(uint3(coord, 0));
+
+    float4 result = inputColor;
+
+    // Apply different wave operations based on mode
+    uint operation = g_waveParams.x;
+
+    switch (operation)
+    {
+        case 0: // Basic wave operations
+            result = DemoBasicWaveOps(inputColor, g_waveParams.y);
+            break;
+
+        case 1: // Bilateral filtering
+            result = WaveBasedBilateralFilter(uv, depth, coord);
+            break;
+
+        case 2: // Prefix sum operations
+            result = WavePrefixSum(inputColor, g_waveParams.z == SCAN_INCLUSIVE);
+            break;
+
+        case 3: // Adaptive sampling
+        {
+            float quality = length(inputColor.rgb) / sqrt(3.0); // Use brightness as quality metric
+            result = WaveAdaptiveSample(uv, quality);
+            break;
+        }
+
+        case 4: // Hierarchical reduction
+            result = HierarchicalReduction(coord, groupID.xy);
+            break;
+
+        default:
+            result = inputColor;
+            break;
+    }
+
+    // Store result
+    g_outputTexture[coord] = result;
+
+    // Generate debug visualization
+    float4 debugVis = VisualizeWaveOperations(uv, coord);
+    g_debugTexture[coord] = debugVis;
+}
+
+// Example pixel shader using wave intrinsics for lighting
+struct PSInput
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+    float3 worldPos : TEXCOORD1;
+    float3 normal : TEXCOORD2;
+};
+
+float4 PSWaveLighting(PSInput input) : SV_Target
+{
+    float3 normal = normalize(input.normal);
+    float3 worldPos = input.worldPos;
+
+    // Use wave intrinsics to compute average lighting across neighboring pixels
+    float3 lightDir = normalize(float3(1, 1, 1));
+    float ndotl = saturate(dot(normal, lightDir));
+
+    // Smooth lighting using wave operations
+    float avgNdotL = WaveActiveSum(ndotl) / float(WaveGetLaneCount());
+    float smoothedLighting = lerp(ndotl, avgNdotL, 0.3);
+
+    // Use wave min/max for lighting bounds
+    float minLighting = WaveActiveMin(ndotl);
+    float maxLighting = WaveActiveMax(ndotl);
+    float lightingRange = maxLighting - minLighting;
+
+    // Adaptive contrast based on local lighting variation
+    float contrast = saturate(lightingRange * 2.0);
+    smoothedLighting = lerp(smoothedLighting, ndotl, contrast);
+
+    float4 baseColor = g_inputTexture.Sample(g_linearSampler, input.uv);
+    return float4(baseColor.rgb * smoothedLighting, baseColor.a);
+}

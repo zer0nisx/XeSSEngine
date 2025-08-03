@@ -9,6 +9,11 @@
 #include <memory>
 #include <vector>
 
+// Forward declarations
+namespace XeSS::Graphics {
+    class ShaderManager;
+}
+
 namespace XeSS::Graphics {
 
 using Microsoft::WRL::ComPtr;
@@ -44,10 +49,15 @@ public:
     std::vector<AdapterInfo> EnumerateAdapters() const;
     bool IsFeatureSupported(D3D11_FEATURE feature) const;
 
+    // Shader management
+    ShaderManager& GetShaderManager();
+    const ShaderManager& GetShaderManager() const;
+
 private:
     void CreateFactory();
     void SelectAdapter(int32 adapterId, bool useWarp);
     void CreateDevice(bool enableDebug);
+    void InitializeShaderManager();
     void QueryAdapterInfo();
 
     ComPtr<ID3D11Device> m_device;
@@ -57,6 +67,8 @@ private:
 
     D3D_FEATURE_LEVEL m_featureLevel{D3D_FEATURE_LEVEL_11_0};
     AdapterInfo m_adapterInfo{};
+
+    std::unique_ptr<ShaderManager> m_shaderManager;
 
     bool m_initialized{false};
 };

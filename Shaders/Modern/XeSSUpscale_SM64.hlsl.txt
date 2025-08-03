@@ -1,0 +1,299 @@
+// XeSSUpscale_SM64.hlsl - Modern XeSS Upscaling Shader (Shader Model 6.4)
+// Features: Wave Intrinsics, Enhanced Texture Operations, Variable Rate Shading
+
+// Requires Shader Model 6.4 for advanced features
+#if __SHADER_TARGET_MAJOR < 6 || (__SHADER_TARGET_MAJOR == 6 && __SHADER_TARGET_MINOR < 4)
+#error "This shader requires Shader Model 6.4 or higher"
+#endif
+
+// Enhanced constant buffer with better packing
+cbuffer XeSSParams : register(b0)
+{
+    float4x4 g_viewProjection;
+    float4 g_jitterOffset;           // xy: current jitter, zw: previous jitter
+    float4 g_screenSize;             // xy: render size, zw: output size
+    float4 g_temporalParams;         // x: frame index, y: reset flag, z: exposure scale, w: motion scale
+    float4 g_sharpeningParams;       // x: sharpening strength, y: contrast, z: saturation, w: padding
+    float4 g_debugParams;            // x: debug mode, y: show motion vectors, z: show depth, w: padding
+
+    // SM 6.4: Better constant buffer layout
+    uint4 g_frameData;               // x: frame count, y: quality preset, z: flags, w: reserved
+    float2 g_velocityScale;          // Motion vector scaling
+    float2 g_depthParams;            // x: near plane, y: far plane
+};
+
+// Enhanced sampler states
+SamplerState g_linearSampler : register(s0);
+SamplerState g_pointSampler : register(s1);
+SamplerState g_linearClampSampler : register(s2);
+
+// Input textures
+Texture2D<float4> g_colorTexture : register(t0);
+Texture2D<float2> g_motionTexture : register(t1);
+Texture2D<float> g_depthTexture : register(t2);
+Texture2D<float4> g_historyTexture : register(t3);
+Texture2D<float> g_exposureTexture : register(t4);
+
+// Output texture (UAV for compute shader)
+RWTexture2D<float4> g_outputTexture : register(u0);
+
+// SM 6.4: Enhanced wave intrinsics and group shared memory
+groupshared float4 g_sharedColor[16][16];
+groupshared float2 g_sharedMotion[16][16];
+groupshared float g_sharedDepth[16][16];
+
+// SM 6.4: Advanced noise functions using wave intrinsics
+float4 GenerateBlueNoise(uint2 coord, uint frameIndex)
+{
+    // Use wave intrinsics for better random generation
+    uint waveIndex = WaveGetLaneIndex();
+    uint waveSize = WaveGetLaneCount();
+
+    // Enhanced blue noise generation
+    uint2 p = coord + uint2(frameIndex & 63, (frameIndex >> 6) & 63);
+    uint h = p.x * 374761393U + p.y * 668265263U + frameIndex * 1103515245U;
+    h = (h << 13) ^ h;
+    h = h * (h * h * 15731U + 789221U) + 1376312589U;
+
+    // Use wave operations for better distribution
+    float noise = float(h & 0x7fffffffU) / float(0x80000000U);
+    float waveNoise = WaveActiveSum(noise) / float(waveSize);
+
+    return float4(noise, waveNoise, frac(noise * 43758.5453), frac(waveNoise * 91654.2341));
+}
+
+// SM 6.4: Advanced motion vector analysis
+float2 AnalyzeMotionVectors(uint2 coord, uint2 groupID, uint2 groupThreadID)
+{
+    // Load motion vectors into shared memory for analysis
+    uint2 sharedCoord = groupThreadID;
+    g_sharedMotion[sharedCoord.x][sharedCoord.y] = g_motionTexture.Load(uint3(coord, 0)).xy;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Use wave intrinsics for motion analysis
+    float2 motion = g_sharedMotion[sharedCoord.x][sharedCoord.y];
+    float2 avgMotion = float2(WaveActiveSum(motion.x), WaveActiveSum(motion.y)) / float(WaveGetLaneCount());
+
+    // Detect motion discontinuities
+    float motionMagnitude = length(motion);
+    float avgMagnitude = WaveActiveSum(motionMagnitude) / float(WaveGetLaneCount());
+
+    // Enhanced motion vector with discontinuity detection
+    float discontinuity = saturate(abs(motionMagnitude - avgMagnitude) * 4.0);
+    return lerp(motion, avgMotion, discontinuity * 0.3);
+}
+
+// SM 6.4: Advanced temporal accumulation with wave operations
+float4 TemporalAccumulation(float2 uv, float2 motion, float depth, uint frameIndex)
+{
+    float4 currentColor = g_colorTexture.SampleLevel(g_linearSampler, uv, 0);
+
+    // Calculate history UV with enhanced reprojection
+    float2 historyUV = uv - motion * g_velocityScale;
+
+    // Check if history sample is valid
+    bool validHistory = all(historyUV >= 0.0) && all(historyUV <= 1.0);
+    if (!validHistory)
+        return currentColor;
+
+    float4 historyColor = g_historyTexture.SampleLevel(g_linearSampler, historyUV, 0);
+
+    // SM 6.4: Use wave intrinsics for neighborhood analysis
+    float4 colorMin = currentColor;
+    float4 colorMax = currentColor;
+
+    // Sample neighborhood using wave operations for better performance
+    const float2 offsets[8] = {
+        float2(-1, -1), float2(0, -1), float2(1, -1),
+        float2(-1,  0),                float2(1,  0),
+        float2(-1,  1), float2(0,  1), float2(1,  1)
+    };
+
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        float2 sampleUV = uv + offsets[i] * g_screenSize.zw;
+        float4 neighborColor = g_colorTexture.SampleLevel(g_pointSampler, sampleUV, 0);
+
+        // Use wave intrinsics for efficient min/max
+        colorMin = min(colorMin, WaveActiveMin(neighborColor));
+        colorMax = max(colorMax, WaveActiveMax(neighborColor));
+    }
+
+    // Clamp history color to neighborhood bounds
+    historyColor = clamp(historyColor, colorMin, colorMax);
+
+    // Enhanced temporal weight calculation
+    float temporalWeight = 0.9;
+
+    // Reduce temporal weight for moving objects
+    float motionFactor = saturate(length(motion) * 10.0);
+    temporalWeight *= (1.0 - motionFactor * 0.5);
+
+    // Reduce temporal weight for depth discontinuities
+    float historyDepth = g_depthTexture.SampleLevel(g_pointSampler, historyUV, 0);
+    float depthDiff = abs(depth - historyDepth);
+    float depthWeight = saturate(1.0 - depthDiff * 100.0);
+    temporalWeight *= depthWeight;
+
+    // Apply frame reset
+    if (g_temporalParams.y > 0.5)
+        temporalWeight = 0.0;
+
+    return lerp(currentColor, historyColor, temporalWeight);
+}
+
+// SM 6.4: Advanced sharpening with adaptive strength
+float4 ApplySharpening(float4 color, float2 uv, float depth)
+{
+    if (g_sharpeningParams.x <= 0.0)
+        return color;
+
+    // Calculate adaptive sharpening strength based on depth and motion
+    float2 motion = g_motionTexture.SampleLevel(g_pointSampler, uv, 0).xy;
+    float motionMagnitude = length(motion);
+    float adaptiveSharpening = g_sharpeningParams.x * (1.0 - saturate(motionMagnitude * 5.0));
+
+    // Sample neighborhood for edge detection
+    float4 center = color;
+    float4 sum = float4(0, 0, 0, 0);
+
+    const float2 offsets[4] = {
+        float2(0, -1), float2(-1, 0), float2(1, 0), float2(0, 1)
+    };
+
+    [unroll]
+    for (int i = 0; i < 4; i++)
+    {
+        float2 sampleUV = uv + offsets[i] * g_screenSize.zw;
+        sum += g_colorTexture.SampleLevel(g_pointSampler, sampleUV, 0);
+    }
+
+    float4 edges = center * 4.0 - sum;
+    float4 sharpened = center + edges * adaptiveSharpening;
+
+    // Apply contrast and saturation adjustments
+    float3 grayscale = dot(sharpened.rgb, float3(0.299, 0.587, 0.114));
+    sharpened.rgb = lerp(grayscale, sharpened.rgb, g_sharpeningParams.z); // Saturation
+    sharpened.rgb = lerp(0.5, sharpened.rgb, g_sharpeningParams.y); // Contrast
+
+    return sharpened;
+}
+
+// SM 6.4: Enhanced exposure handling
+float4 ApplyExposure(float4 color, float2 uv)
+{
+    float exposure = g_exposureTexture.SampleLevel(g_pointSampler, uv, 0);
+    exposure *= g_temporalParams.z; // Global exposure scale
+
+    // Apply exposure with proper tone mapping
+    color.rgb *= exposure;
+
+    // Simple Reinhard tone mapping
+    color.rgb = color.rgb / (1.0 + color.rgb);
+
+    return color;
+}
+
+// SM 6.4: Debug visualization modes
+float4 ApplyDebugVisualization(float4 color, float2 uv, float2 motion, float depth)
+{
+    uint debugMode = (uint)g_debugParams.x;
+
+    switch (debugMode)
+    {
+        case 1: // Show motion vectors
+            return float4(motion * 10.0 + 0.5, 0, 1);
+
+        case 2: // Show depth
+            return float4(depth.xxx, 1);
+
+        case 3: // Show sharpening mask
+            float motionMagnitude = length(motion);
+            float mask = 1.0 - saturate(motionMagnitude * 5.0);
+            return float4(mask.xxx, 1);
+
+        case 4: // Show temporal weight
+            float2 historyUV = uv - motion * g_velocityScale;
+            bool validHistory = all(historyUV >= 0.0) && all(historyUV <= 1.0);
+            float weight = validHistory ? 0.9 : 0.0;
+            return float4(weight.xxx, 1);
+
+        default:
+            return color;
+    }
+}
+
+// Main compute shader entry point
+[numthreads(16, 16, 1)]
+void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID,
+           uint3 groupID : SV_GroupID,
+           uint3 groupThreadID : SV_GroupThreadID,
+           uint groupIndex : SV_GroupIndex)
+{
+    uint2 coord = dispatchThreadID.xy;
+
+    // Early exit for out-of-bounds
+    if (any(coord >= uint2(g_screenSize.zw)))
+        return;
+
+    float2 uv = (float2(coord) + 0.5) / g_screenSize.zw;
+    uint frameIndex = (uint)g_temporalParams.x;
+
+    // Load depth for this pixel
+    float depth = g_depthTexture.Load(uint3(coord, 0));
+
+    // Enhanced motion vector analysis using shared memory
+    float2 motion = AnalyzeMotionVectors(coord, groupID.xy, groupThreadID.xy);
+
+    // Temporal accumulation with history validation
+    float4 color = TemporalAccumulation(uv, motion, depth, frameIndex);
+
+    // Apply exposure correction
+    color = ApplyExposure(color, uv);
+
+    // Apply adaptive sharpening
+    color = ApplySharpening(color, uv, depth);
+
+    // Debug visualization (if enabled)
+    if (g_debugParams.x > 0.0)
+        color = ApplyDebugVisualization(color, uv, motion, depth);
+
+    // Add blue noise for dithering (reduces banding)
+    float4 noise = GenerateBlueNoise(coord, frameIndex);
+    color.rgb += (noise.rgb - 0.5) * (1.0 / 255.0);
+
+    // Write final result
+    g_outputTexture[coord] = color;
+}
+
+// Alternative pixel shader version for graphics pipeline
+struct VSOutput
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+float4 PSMain(VSOutput input) : SV_Target
+{
+    uint2 coord = uint2(input.position.xy);
+    float2 uv = input.uv;
+    uint frameIndex = (uint)g_temporalParams.x;
+
+    float depth = g_depthTexture.SampleLevel(g_pointSampler, uv, 0);
+    float2 motion = g_motionTexture.SampleLevel(g_pointSampler, uv, 0).xy;
+
+    // Simplified version for pixel shader (no shared memory)
+    float4 color = TemporalAccumulation(uv, motion, depth, frameIndex);
+    color = ApplyExposure(color, uv);
+    color = ApplySharpening(color, uv, depth);
+
+    if (g_debugParams.x > 0.0)
+        color = ApplyDebugVisualization(color, uv, motion, depth);
+
+    float4 noise = GenerateBlueNoise(coord, frameIndex);
+    color.rgb += (noise.rgb - 0.5) * (1.0 / 255.0);
+
+    return color;
+}

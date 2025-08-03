@@ -1,4 +1,5 @@
 #include "Device.h"
+#include "ShaderManager.h"
 #include "Core/Logger.h"
 #include "Core/Utils.h"
 
@@ -23,6 +24,7 @@ void Device::Initialize(int32 adapterId, bool useWarp, bool enableDebug) {
         SelectAdapter(adapterId, useWarp);
         CreateDevice(enableDebug);
         QueryAdapterInfo();
+        InitializeShaderManager();
 
         m_initialized = true;
 
@@ -43,6 +45,12 @@ void Device::Shutdown() {
     }
 
     XESS_INFO("Shutting down DirectX 11 device");
+
+    // Shutdown shader manager first
+    if (m_shaderManager) {
+        m_shaderManager->Shutdown();
+        m_shaderManager.reset();
+    }
 
     if (m_context) {
         m_context->ClearState();
